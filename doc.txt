@@ -1,0 +1,661 @@
+//************************unsafe*****************************************
+private final class NioByteUnsafe extends AbstractNioUnsafe {
+        private RecvByteBufAllocator.Handle allocHandle;
+
+        @Override
+        public void read() {
+            final ChannelConfig config = config();
+            final ChannelPipeline pipeline = pipeline();
+            final ByteBufAllocator allocator = config.getAllocator();
+            final int maxMessagesPerRead = config.getMaxMessagesPerRead();
+            RecvByteBufAllocator.Handle allocHandle = this.allocHandle;
+            if (allocHandle == null) {
+                this.allocHandle = allocHandle = config.getRecvByteBufAllocator().newHandle();
+            }
+            if (!config.isAutoRead()) {
+                removeReadOp();
+            }
+
+            ByteBuf byteBuf = null;
+            int messages = 0;
+            boolean close = false;
+            try {
+                int byteBufCapacity = allocHandle.guess();
+                int totalReadAmount = 0;
+                do {
+                    byteBuf = allocator.ioBuffer(byteBufCapacity);
+                    int writable = byteBuf.writableBytes();
+                    int localReadAmount = doReadBytes(byteBuf);
+                    if (localReadAmount <= 0) {
+                        // not was read release the buffer
+                        byteBuf.release();
+                        close = localReadAmount < 0;
+                        break;
+                    }
+
+                    pipeline.fireChannelRead(byteBuf);
+                    byteBuf = null;
+
+                    if (totalReadAmount >= Integer.MAX_VALUE - localReadAmount) {
+                        // Avoid overflow.
+                        totalReadAmount = Integer.MAX_VALUE;
+                        break;
+                    }
+
+                    totalReadAmount += localReadAmount;
+                    if (localReadAmount < writable) {
+                        // Read less than what the buffer can hold,
+                        // which might mean we drained the recv buffer completely.
+                        break;
+                    }
+                } while (++ messages < maxMessagesPerRead);
+
+                pipeline.fireChannelReadComplete();
+                allocHandle.record(totalReadAmount);
+
+                if (close) {
+                    closeOnRead(pipeline);
+                    close = false;
+                }
+            } catch (Throwable t) {
+                handleReadException(pipeline, byteBuf, t, close);
+            }
+        }
+    }
+
+//NioSocketChannel.doReadBytes()调用SocketChannel来读取数据
+ protected int doReadBytes(ByteBuf byteBuf) throws Exception {
+        return byteBuf.writeBytes(javaChannel(), byteBuf.writableBytes());
+    }
+    
+//*************************操作位***************************************************
+一个典型的Java NIO服务端的代码如下:
+		[java] view plaincopy
+		public NIOServer(int port) throws IOException {    
+		        ServerSocketChannel serverSocketChannel = ServerSocketChannel.open();    
+		        serverSocketChannel.configureBlocking(false);     
+		        ServerSocket serverSocket = serverSocketChannel.socket();    
+		        serverSocket.bind(port);    
+		        selector = Selector.open();    
+		        // 注册到selector，等待连接    
+		        serverSocketChannel.register(selector, SelectionKey.OP_ACCEPT);    
+		    }    
+
+		[java] view plaincopy
+		private void eventloop() throws IOException {    
+		        while (true) {     
+		            selector.select();     //在循环中轮询选择器  选择器结构
+		            Set<SelectionKey> selectionKeys = selector.selectedKeys();    
+		            Iterator<SelectionKey> iterator = selectionKeys.iterator();    
+		            while (iterator.hasNext()) {            
+		                SelectionKey selectionKey = iterator.next();    
+		                iterator.remove();    
+		                handleSelectedKey(selectionKey);    
+		            }    
+		        }    
+		    }    
+		[java] view plaincopy
+		private void handleKey(SelectionKey selectionKey) throws IOException {    
+		        ServerSocketChannel server = null;    
+		        SocketChannel client = null;    
+		   
+		        if (selectionKey.isAcceptable()) {    
+		            server = (ServerSocketChannel) selectionKey.channel();      
+		            client = server.accept();    
+		            // 配置为非阻塞    
+		            client.configureBlocking(false);    
+		            // 注册到selector，等待连接    
+		            client.register(selector, SelectionKey.OP_READ);    
+		        } else if (selectionKey.isReadable()) {    
+		            client = (SocketChannel) selectionKey.channel();    
+		            client.read(receivebuffer);     
+		        } else if (selectionKey.isWritable()) {     
+		            sendbuffer.clear();      
+		            client = (SocketChannel) selectionKey.channel();    
+		            client.write(sendbuffer);    
+		        }    
+		    }  
+		    
+		    
+		    那么Netty是如何来注册Accept和读写事件的呢？　首先来看如何注册的OP_ACCPET事件，是在服务器端绑定端口的过程中的，具体的绑定细节看这篇 http://blog.csdn.net/iter_zc/article/details/39349177 这里只分析注册OP_ACCEPT的过程。
+
+在ServerBootstrap调用createChannel来创建NioServerSocketChannel的时候，会给NioServerSocketChannel传入要绑定的OP_ACCEPT事件，
+然后依次调用父类的构造函数，把readInterestOp往上传递，直到传递到AbstractNioChannel，作为AbstractNioChannel的一个实例属性readInterestOp.
+
+[java] view plaincopy
+public NioServerSocketChannel(EventLoop eventLoop, EventLoopGroup childGroup) {  
+        super(null, eventLoop, childGroup, newSocket(), SelectionKey.OP_ACCEPT);  
+        config = new DefaultServerSocketChannelConfig(this, javaChannel().socket());  
+    }  
+  
+protected AbstractNioMessageServerChannel(  
+            Channel parent, EventLoop eventLoop, EventLoopGroup childGroup, SelectableChannel ch, int readInterestOp) {  
+        super(parent, eventLoop, ch, readInterestOp);  
+        this.childGroup = childGroup;  
+    }  
+  
+protected AbstractNioMessageChannel(  
+            Channel parent, EventLoop eventLoop, SelectableChannel ch, int readInterestOp) {  
+        super(parent, eventLoop, ch, readInterestOp);  
+    }  
+  
+protected AbstractNioChannel(Channel parent, EventLoop eventLoop, SelectableChannel ch, int readInterestOp) {  
+        super(parent, eventLoop);  
+        this.ch = ch;  
+        this.readInterestOp = readInterestOp;  
+        try {  
+            ch.configureBlocking(false);  
+        } catch (IOException e) {  
+            try {  
+                ch.close();  
+            } catch (IOException e2) {  
+                if (logger.isWarnEnabled()) {  
+                    logger.warn(  
+                            "Failed to close a partially initialized socket.", e2);  
+                }  
+            }  
+  
+            throw new ChannelException("Failed to enter non-blocking mode.", e);  
+        }  
+    }  
+
+可以看到在AbstractNioChannel的构造函数里面并没有把Channel注册到selector之上，只是把OP_ACCEPT赋值给了readInterestOp。
+在服务器绑定的过程中有一个register的过程，最后调用到了AbstractNioChannel的doRegister方法。
+这里可以看到调用的ServerSocketChannel得register方法，但是并没有注册具体的事件，传了一个0，表示不注册任何事件。
+这里做了一件事情就是把Channel作为Attachment绑定到了SelectionKey之上。
+[java] view plaincopy
+protected void doRegister() throws Exception {  
+        boolean selected = false;  
+        for (;;) {  
+            try {  
+                selectionKey = javaChannel().register(eventLoop().selector, 0, this);  
+                return;  
+            } catch (CancelledKeyException e) {  
+                if (!selected) {  
+                    // Force the Selector to select now as the "canceled" SelectionKey may still be  
+                    // cached and not removed because no Select.select(..) operation was called yet.  
+                    eventLoop().selectNow();  
+                    selected = true;  
+                } else {  
+                    // We forced a select operation on the selector before but the SelectionKey is still cached  
+                    // for whatever reason. JDK bug ?  
+                    throw e;  
+                }  
+            }  
+        }  
+    }  
+  
+// SelectionKey的事件的值  
+  
+public static final int OP_READ = 1 << 0;  // 1  
+public static final int OP_WRITE = 1 << 2  // 4  
+public static final int OP_CONNECT = 1 << 3; // 8  
+public static final int OP_ACCEPT = 1 << 4;  // 16  
+
+Channel注册到Selector有两种方式，一种是调用Channel的register方法，第二种是设置SelectionKey的interestOps的值。Netty是用了第二种方式，
+通过设置SelectionKey的interestOps来注册Channel关心的事件，把实际的注册延迟了。
+在服务器端绑定的过程中，在bind完之后会fireChannelActive事件，在fireChannelActive执行之后，会让Channel主动发起一个outbound的读事件，
+通过Pipeline最后传递到HeadHandler，HeadHandler会实际使用Unsafe来进行读写。HeadHandler处理读时间时，调用了Unsafe的beginRead方法，
+最后到了AbstractNioChannel来设置SelectionKey的interestOps属性，来最终把Channel绑定到Selector。
+
+[java] view plaincopy
+ public final void bind(final SocketAddress localAddress, final ChannelPromise promise) {  
+            if (!ensureOpen(promise)) {  
+                return;  
+            }  
+  
+            // See: https://github.com/netty/netty/issues/576  
+            if (!PlatformDependent.isWindows() && !PlatformDependent.isRoot() &&  
+                Boolean.TRUE.equals(config().getOption(ChannelOption.SO_BROADCAST)) &&  
+                localAddress instanceof InetSocketAddress &&  
+                !((InetSocketAddress) localAddress).getAddress().isAnyLocalAddress()) {  
+                // Warn a user about the fact that a non-root user can't receive a  
+                // broadcast packet on *nix if the socket is bound on non-wildcard address.  
+                logger.warn(  
+                        "A non-root user can't receive a broadcast packet if the socket " +  
+                        "is not bound to a wildcard address; binding to a non-wildcard " +  
+                        "address (" + localAddress + ") anyway as requested.");  
+            }  
+  
+            boolean wasActive = isActive();  
+            try {  
+                doBind(localAddress);  
+            } catch (Throwable t) {  
+                promise.setFailure(t);  
+                closeIfClosed();  
+                return;  
+            }  
+            if (!wasActive && isActive()) {  
+                invokeLater(new Runnable() {  
+                    @Override  
+                    public void run() {  
+                        pipeline.fireChannelActive();  
+                    }  
+                });  
+            }  
+            promise.setSuccess();  
+        }  
+  
+public ChannelPipeline fireChannelActive() {  
+        head.fireChannelActive();  
+  
+        if (channel.config().isAutoRead()) {  
+        //发出outbound读事件  
+            channel.read();  
+        }  
+  
+        return this;  
+    }  
+  
+       // HeadHandler.read  
+ public void read(ChannelHandlerContext ctx) {  
+            unsafe.beginRead();  
+        }  
+  
+// 最后调用到AbstractNioChannel的doBeginRead方法来设置SelectionKey，此时的readInterestOps是OP_ACCEPT = 16，selectionKey.interestOps=0  
+// 所以进入到 selectionKey.interestOps(interestOps | readInterestOp); 使用或操作设置selectionKey的interestOps为OP_ACCEPT  
+  
+@Override  
+    protected void doBeginRead() throws Exception {  
+        if (inputShutdown) {  
+            return;  
+        }  
+  
+        final SelectionKey selectionKey = this.selectionKey;  
+        if (!selectionKey.isValid()) {  
+            return;  
+        }  
+  
+        final int interestOps = selectionKey.interestOps();  
+        if ((interestOps & readInterestOp) == 0) {  
+            selectionKey.interestOps(interestOps | readInterestOp);  
+        }  
+    }  
+    
+    
+
+再看OP_READ事件的注册过程。
+1. 当有客户端连接请求过来时，前端的NioEventLoop会通过Selector找到响应的SelectionKey,Netty把OP_READ和OP_ACCEPT统一使用Unsafe的read来处理。
+
+2. 对于OP_ACCEPT事件，调用的是NioMessageUnsafe, 先会执行到NioServerSocketChannel的doReadMessage来处理连接请求
+
+3. 当NioServerSocketChannel通过调用ServerSocketChannel的accept来创建客户端SocketChannel时，会传递OP_READ事件到NioSocketChannel的构造函数，
+最后到了AbstractNioChannel的构造函数，和OP_ACCEPT一样，成为AbstractNioChannel的readInterestOps属性。
+4. 处理完之后NioMessageUnsafe会fireChannelRead来使用Pipeline传递事件，调用到ServerBootstrapAcceptor的channelRead方法来把
+Channel注册到selector，也只是注册了一个0到selector，把Channel作为Attachment绑定到SelectionKey。
+
+RE5. 和OP_ACCEPT一样，注册完之后会发出fireChannelActive事件,最后调用HeadHandler的read方法，在这个方法里面调用Unsafe的beginRead方法。
+这里的Unsafe的实例是NioByteUnsafe，最后又进入到AbstractNioChanel的doReadBegin来设置Selectionkey的interestOps为OP_READ
+
+[java] view plaincopy
+// NioEventLoop处理事件分发  
+  
+ private static void processSelectedKey(SelectionKey k, AbstractNioChannel ch) {  
+        final NioUnsafe unsafe = ch.unsafe();  
+        if (!k.isValid()) {  
+            // close the channel if the key is not valid anymore  
+            unsafe.close(unsafe.voidPromise());  
+            return;  
+        }  
+  
+        try {  
+            int readyOps = k.readyOps();  
+            // Also check for readOps of 0 to workaround possible JDK bug which may otherwise lead  
+            // to a spin loop  
+            if ((readyOps & (SelectionKey.OP_READ | SelectionKey.OP_ACCEPT)) != 0 || readyOps == 0) {  
+                unsafe.read();  
+                if (!ch.isOpen()) {  
+                    // Connection already closed - no need to handle write.  
+                    return;  
+                }  
+            }  
+            if ((readyOps & SelectionKey.OP_WRITE) != 0) {  
+                // Call forceFlush which will also take care of clear the OP_WRITE once there is nothing left to write  
+                ch.unsafe().forceFlush();  
+            }  
+            if ((readyOps & SelectionKey.OP_CONNECT) != 0) {  
+                // remove OP_CONNECT as otherwise Selector.select(..) will always return without blocking  
+                // See https://github.com/netty/netty/issues/924  
+                int ops = k.interestOps();  
+                ops &= ~SelectionKey.OP_CONNECT;  
+                k.interestOps(ops);  
+  
+                unsafe.finishConnect();  
+            }  
+        } catch (CancelledKeyException e) {  
+            unsafe.close(unsafe.voidPromise());  
+        }  
+    }  
+  
+  
+public void read() {  
+            assert eventLoop().inEventLoop();  
+            if (!config().isAutoRead()) {  
+                removeReadOp();  
+            }  
+  
+            final ChannelConfig config = config();  
+            final int maxMessagesPerRead = config.getMaxMessagesPerRead();  
+            final boolean autoRead = config.isAutoRead();  
+            final ChannelPipeline pipeline = pipeline();  
+            boolean closed = false;  
+            Throwable exception = null;  
+            try {  
+                for (;;) {  
+                    int localRead = doReadMessages(readBuf);  
+                    if (localRead == 0) {  
+                        break;  
+                    }  
+                    if (localRead < 0) {  
+                        closed = true;  
+                        break;  
+                    }  
+  
+                    if (readBuf.size() >= maxMessagesPerRead | !autoRead) {  
+                        break;  
+                    }  
+                }  
+            } catch (Throwable t) {  
+                exception = t;  
+            }  
+  
+            int size = readBuf.size();  
+            for (int i = 0; i < size; i ++) {  
+                pipeline.fireChannelRead(readBuf.get(i));  
+            }  
+            readBuf.clear();  
+            pipeline.fireChannelReadComplete();  
+  
+            if (exception != null) {  
+                if (exception instanceof IOException) {  
+                    // ServerChannel should not be closed even on IOException because it can often continue  
+                    // accepting incoming connections. (e.g. too many open files)  
+                    closed = !(AbstractNioMessageChannel.this instanceof ServerChannel);  
+                }  
+  
+                pipeline.fireExceptionCaught(exception);  
+            }  
+  
+            if (closed) {  
+                if (isOpen()) {  
+                    close(voidPromise());  
+                }  
+            }  
+        }  
+    }  
+  
+// NioServerSocketChannel.doReadMessage方法  
+protected int doReadMessages(List<Object> buf) throws Exception {  
+        SocketChannel ch = javaChannel().accept();  
+  
+        try {  
+            if (ch != null) {  
+                buf.add(new NioSocketChannel(this, childEventLoopGroup().next(), ch));  
+                return 1;  
+            }  
+        } catch (Throwable t) {  
+            logger.warn("Failed to create a new channel from an accepted socket.", t);  
+  
+            try {  
+                ch.close();  
+            } catch (Throwable t2) {  
+                logger.warn("Failed to close a socket.", t2);  
+            }  
+        }  
+  
+        return 0;  
+    }  
+  
+public NioSocketChannel(Channel parent, EventLoop eventLoop, SocketChannel socket) {  
+        super(parent, eventLoop, socket);  
+        config = new DefaultSocketChannelConfig(this, socket.socket());  
+    }  
+  
+protected AbstractNioByteChannel(Channel parent, EventLoop eventLoop, SelectableChannel ch) {  
+        super(parent, eventLoop, ch, SelectionKey.OP_READ);  
+    }  
+  
+protected AbstractNioChannel(Channel parent, EventLoop eventLoop, SelectableChannel ch, int readInterestOp) {  
+        super(parent, eventLoop);  
+        this.ch = ch;  
+        this.readInterestOp = readInterestOp;  
+        try {  
+            ch.configureBlocking(false);  
+        } catch (IOException e) {  
+            try {  
+                ch.close();  
+            } catch (IOException e2) {  
+                if (logger.isWarnEnabled()) {  
+                    logger.warn(  
+                            "Failed to close a partially initialized socket.", e2);  
+                }  
+            }  
+  
+            throw new ChannelException("Failed to enter non-blocking mode.", e);  
+        }  
+    }  
+  
+// ServerBootstrapAcceptor.channelRead方法来注册Channel  
+public void channelRead(ChannelHandlerContext ctx, Object msg) {  
+            Channel child = (Channel) msg;  
+  
+            child.pipeline().addLast(childHandler);  
+  
+            for (Entry<ChannelOption<?>, Object> e: childOptions) {  
+                try {  
+                    if (!child.config().setOption((ChannelOption<Object>) e.getKey(), e.getValue())) {  
+                        logger.warn("Unknown channel option: " + e);  
+                    }  
+                } catch (Throwable t) {  
+                    logger.warn("Failed to set a channel option: " + child, t);  
+                }  
+            }  
+  
+            for (Entry<AttributeKey<?>, Object> e: childAttrs) {  
+                child.attr((AttributeKey<Object>) e.getKey()).set(e.getValue());  
+            }  
+  
+            child.unsafe().register(child.newPromise());  
+        }  
+  
+// AbstractChannel的register0方法，先注册，后fireChannelActive来调用HeadHandler设置SelectionKey的interestOps  
+private void register0(ChannelPromise promise) {  
+            try {  
+                // check if the channel is still open as it could be closed in the mean time when the register  
+                // call was outside of the eventLoop  
+                if (!ensureOpen(promise)) {  
+                    return;  
+                }  
+                doRegister();  
+                registered = true;  
+                promise.setSuccess();  
+                pipeline.fireChannelRegistered();  
+                if (isActive()) {  
+                    pipeline.fireChannelActive();  
+                }  
+            } catch (Throwable t) {  
+                // Close the channel directly to avoid FD leak.  
+                closeForcibly();  
+                closeFuture.setClosed();  
+                if (!promise.tryFailure(t)) {  
+                    logger.warn(  
+                            "Tried to fail the registration promise, but it is complete already. " +  
+                                    "Swallowing the cause of the registration failure:", t);  
+                }  
+            }  
+        }  
+  
+  
+  
+// AbstractNioChannel 注册Channel到selector,只注册空事件，具体OP_READ事件延迟注册  
+protected void doRegister() throws Exception {  
+        boolean selected = false;  
+        for (;;) {  
+            try {  
+                selectionKey = javaChannel().register(eventLoop().selector, 0, this);  
+                return;  
+            } catch (CancelledKeyException e) {  
+                if (!selected) {  
+                    // Force the Selector to select now as the "canceled" SelectionKey may still be  
+                    // cached and not removed because no Select.select(..) operation was called yet.  
+                    eventLoop().selectNow();  
+                    selected = true;  
+                } else {  
+                    // We forced a select operation on the selector before but the SelectionKey is still cached  
+                    // for whatever reason. JDK bug ?  
+                    throw e;  
+                }  
+            }  
+        }  
+    }  
+  
+  
+ protected void doBeginRead() throws Exception {  
+        if (inputShutdown) {  
+            return;  
+        }  
+  
+        final SelectionKey selectionKey = this.selectionKey;  
+        if (!selectionKey.isValid()) {  
+            return;  
+        }  
+// interestOps = 0, readInterestOps = OP_READ = 1  
+        final int interestOps = selectionKey.interestOps();  
+        if ((interestOps & readInterestOp) == 0) {  
+            selectionKey.interestOps(interestOps | readInterestOp);  
+        }  
+    }  
+
+最后看OP_WRITE如何注册。OP_WRITE比较特殊，表示本地的写缓冲区可用，一般只有在一次写没有把数据写完的情况下需要注册OP_WRITE，写完后要及时关闭，否则每次循环都有可能被调用，
+因为写缓冲区在大多数情况下是始终可用的。
+Netty只有在flush的时候才会实际调用底层的写方法把数据写到网络中去。ChannelHandlerContext提供了flush和writeAndFlush方法来作flush。
+[java] view plaincopy
+// AbstractNioByteChannel的打开，关闭写事件的方法  
+  
+protected final void setOpWrite() {  
+        final SelectionKey key = selectionKey();  
+        final int interestOps = key.interestOps();  
+        if ((interestOps & SelectionKey.OP_WRITE) == 0) {  
+            key.interestOps(interestOps | SelectionKey.OP_WRITE);  
+        }  
+    }  
+  
+    protected final void clearOpWrite() {  
+        final SelectionKey key = selectionKey();  
+        final int interestOps = key.interestOps();  
+        if ((interestOps & SelectionKey.OP_WRITE) != 0) {  
+            key.interestOps(interestOps & ~SelectionKey.OP_WRITE);  
+        }  
+    }  
+  
+//在写半包的情况下会设置OP_WRITE  
+protected final void incompleteWrite(boolean setOpWrite) {  
+        // Did not write completely.  
+        if (setOpWrite) {  
+            setOpWrite();  
+        } else {  
+            // Schedule flush again later so other tasks can be picked up in the meantime  
+            Runnable flushTask = this.flushTask;  
+            if (flushTask == null) {  
+                flushTask = this.flushTask = new Runnable() {  
+                    @Override  
+                    public void run() {  
+                        flush();  
+                    }  
+                };  
+            }  
+            eventLoop().execute(flushTask);  
+        }  
+    }  
+  
+protected void doWrite(ChannelOutboundBuffer in) throws Exception {  
+        int writeSpinCount = -1;  
+  
+        for (;;) {  
+            Object msg = in.current(true);  
+            if (msg == null) {  
+                // Wrote all messages.  
+                clearOpWrite();  
+                break;  
+            }  
+  
+            if (msg instanceof ByteBuf) {  
+                ByteBuf buf = (ByteBuf) msg;  
+                int readableBytes = buf.readableBytes();  
+                if (readableBytes == 0) {  
+                    in.remove();  
+                    continue;  
+                }  
+  
+                boolean setOpWrite = false;  
+                boolean done = false;  
+                long flushedAmount = 0;  
+                if (writeSpinCount == -1) {  
+                    writeSpinCount = config().getWriteSpinCount();  
+                }  
+                for (int i = writeSpinCount - 1; i >= 0; i --) {  
+                    int localFlushedAmount = doWriteBytes(buf);  
+                    if (localFlushedAmount == 0) {  
+                        setOpWrite = true;  
+                        break;  
+                    }  
+  
+                    flushedAmount += localFlushedAmount;  
+                    if (!buf.isReadable()) {  
+                        done = true;  
+                        break;  
+                    }  
+                }  
+  
+                in.progress(flushedAmount);  
+  
+                if (done) {  
+                    in.remove();  
+                } else {  
+                    incompleteWrite(setOpWrite);  
+                    break;  
+                }  
+            }  
+  
+// AbstractUnsafe的flush0方法调用了doWrite  
+  
+protected void flush0() {  
+            if (inFlush0) {  
+                // Avoid re-entrance  
+                return;  
+            }  
+  
+            final ChannelOutboundBuffer outboundBuffer = this.outboundBuffer;  
+            if (outboundBuffer == null || outboundBuffer.isEmpty()) {  
+                return;  
+            }  
+  
+            inFlush0 = true;  
+  
+            // Mark all pending write requests as failure if the channel is inactive.  
+            if (!isActive()) {  
+                try {  
+                    if (isOpen()) {  
+                        outboundBuffer.failFlushed(NOT_YET_CONNECTED_EXCEPTION);  
+                    } else {  
+                        outboundBuffer.failFlushed(CLOSED_CHANNEL_EXCEPTION);  
+                    }  
+                } finally {  
+                    inFlush0 = false;  
+                }  
+                return;  
+            }  
+  
+            try {  
+                doWrite(outboundBuffer);  
+            } catch (Throwable t) {  
+                outboundBuffer.failFlushed(t);  
+            } finally {  
+                inFlush0 = false;  
+            }  
+        }  
+
+
+通过分析Netty注册OP_ACCEPT, OP_READ, OP_WRITE事件的过程，再比照使用原生的Java NIO API开发的过程，能够更深入的理解Netty的封装过程
+		    
+
